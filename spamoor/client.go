@@ -3,6 +3,8 @@ package spamoor
 import (
 	"context"
 	"math/big"
+	"net"
+	"net/http"
 	"net/url"
 	"strings"
 	"sync"
@@ -41,6 +43,11 @@ type Client struct {
 
 	clientVersion     string
 	clientVersionTime time.Time
+
+	// Connection health tracking
+	failureCount      uint64
+	failureCountMutex sync.Mutex
+	lastFailureTime   time.Time
 }
 
 // NewClient creates a new Client instance with the specified RPC host URL.
@@ -100,7 +107,28 @@ func NewClient(rpchost string) (*Client, error) {
 	}
 
 	ctx := context.Background()
-	rpcClient, err := rpc.DialContext(ctx, rpchost)
+
+	// Create custom HTTP transport with connection management to prevent socket leaks
+	httpClient := &http.Client{
+		Transport: &http.Transport{
+			Proxy: http.ProxyFromEnvironment,
+			DialContext: (&net.Dialer{
+				Timeout:   30 * time.Second,
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
+			MaxIdleConns:          100,
+			MaxIdleConnsPerHost:   10,
+			MaxConnsPerHost:       10,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+			ForceAttemptHTTP2:     true,
+			DisableKeepAlives:     false,
+		},
+		Timeout: 60 * time.Second,
+	}
+
+	rpcClient, err := rpc.DialOptions(ctx, rpchost, rpc.WithHTTPClient(httpClient))
 	if err != nil {
 		return nil, err
 	}
@@ -383,4 +411,57 @@ func (client *Client) GetClientVersion(ctx context.Context) (string, error) {
 	client.clientVersionTime = time.Now()
 
 	return result, nil
+}
+
+// Close closes the RPC client connection to prevent socket leaks.
+// This should be called when the client is no longer needed or when
+// switching to a new client due to persistent errors.
+func (client *Client) Close() {
+	if client.rpcClient != nil {
+		client.rpcClient.Close()
+	}
+}
+
+// IncrementFailureCount increments the failure counter and updates the last failure time.
+// This is used to track connection health and identify problematic clients.
+func (client *Client) IncrementFailureCount() {
+	client.failureCountMutex.Lock()
+	defer client.failureCountMutex.Unlock()
+	client.failureCount++
+	client.lastFailureTime = time.Now()
+}
+
+// ResetFailureCount resets the failure counter to zero.
+// This should be called after successful operations to maintain accurate health tracking.
+func (client *Client) ResetFailureCount() {
+	client.failureCountMutex.Lock()
+	defer client.failureCountMutex.Unlock()
+	client.failureCount = 0
+}
+
+// GetFailureCount returns the current failure count and last failure time.
+func (client *Client) GetFailureCount() (uint64, time.Time) {
+	client.failureCountMutex.Lock()
+	defer client.failureCountMutex.Unlock()
+	return client.failureCount, client.lastFailureTime
+}
+
+// IsHealthy checks if the client is considered healthy based on failure count and time.
+// A client is unhealthy if it has more than 10 consecutive failures in the last 5 minutes.
+func (client *Client) IsHealthy() bool {
+	client.failureCountMutex.Lock()
+	defer client.failureCountMutex.Unlock()
+
+	if client.failureCount == 0 {
+		return true
+	}
+
+	// Reset failure count if last failure was more than 5 minutes ago
+	if time.Since(client.lastFailureTime) > 5*time.Minute {
+		client.failureCount = 0
+		return true
+	}
+
+	// Consider unhealthy if more than 10 consecutive failures
+	return client.failureCount < 10
 }

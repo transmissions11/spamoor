@@ -35,15 +35,18 @@ type ClientPool struct {
 	chainId        *big.Int
 	selectionMutex sync.Mutex
 	rrClientIdx    int
+	clientMap      map[string]*Client // Maps RPC host to client for reconnection
+	clientMapMutex sync.RWMutex
 }
 
 // NewClientPool creates a new ClientPool with the specified RPC hosts and logger.
 // The pool must be initialized with PrepareClients() before use.
 func NewClientPool(ctx context.Context, rpcHosts []string, logger logrus.FieldLogger) *ClientPool {
 	return &ClientPool{
-		ctx:      ctx,
-		rpcHosts: rpcHosts,
-		logger:   logger,
+		ctx:       ctx,
+		rpcHosts:  rpcHosts,
+		logger:    logger,
+		clientMap: make(map[string]*Client),
 	}
 }
 
@@ -62,6 +65,9 @@ func (pool *ClientPool) PrepareClients() error {
 		}
 
 		pool.allClients = append(pool.allClients, client)
+		pool.clientMapMutex.Lock()
+		pool.clientMap[rpcHost] = client
+		pool.clientMapMutex.Unlock()
 
 		if chainId == nil {
 			client.Timeout = 10 * time.Second
@@ -154,14 +160,70 @@ func (pool *ClientPool) watchClientStatus() error {
 		goodHead -= 2
 	}
 	for idx, client := range pool.allClients {
-		if clientHeads[idx] >= goodHead {
+		// Check both block height and connection health
+		if clientHeads[idx] >= goodHead && client.IsHealthy() {
 			goodClients = append(goodClients, client)
+		} else if !client.IsHealthy() {
+			// Reconnect unhealthy clients
+			pool.logger.Warnf("Client %s is unhealthy with %d failures, reconnecting...", client.GetName(), client.failureCount)
+			pool.reconnectClient(client)
 		}
 	}
 	pool.goodClients = goodClients
 	pool.logger.Infof("client check completed (%v good clients, %v bad clients)", len(goodClients), len(pool.allClients)-len(goodClients))
 
 	return nil
+}
+
+// reconnectClient closes the existing client connection and creates a new one.
+// This helps recover from connection issues and socket leaks.
+func (pool *ClientPool) reconnectClient(oldClient *Client) {
+	// Find the RPC host for this client
+	pool.clientMapMutex.RLock()
+	var rpcHost string
+	for host, client := range pool.clientMap {
+		if client == oldClient {
+			rpcHost = host
+			break
+		}
+	}
+	pool.clientMapMutex.RUnlock()
+
+	if rpcHost == "" {
+		pool.logger.Errorf("Could not find RPC host for client %s", oldClient.GetName())
+		return
+	}
+
+	// Close the old client connection
+	oldClient.Close()
+
+	// Create a new client
+	newClient, err := NewClient(rpcHost)
+	if err != nil {
+		pool.logger.Errorf("Failed to reconnect client for '%v': %v", rpcHost, err.Error())
+		return
+	}
+
+	// Copy settings from old client
+	newClient.Timeout = oldClient.Timeout
+	newClient.SetClientGroups(oldClient.GetClientGroups())
+	newClient.SetEnabled(oldClient.IsEnabled())
+	newClient.SetNameOverride(oldClient.GetNameOverride())
+
+	// Replace in allClients slice
+	for idx, client := range pool.allClients {
+		if client == oldClient {
+			pool.allClients[idx] = newClient
+			break
+		}
+	}
+
+	// Update client map
+	pool.clientMapMutex.Lock()
+	pool.clientMap[rpcHost] = newClient
+	pool.clientMapMutex.Unlock()
+
+	pool.logger.Infof("Successfully reconnected client %s", newClient.GetName())
 }
 
 // GetClient returns a client from the pool based on the specified selection mode.

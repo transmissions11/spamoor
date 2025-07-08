@@ -806,12 +806,18 @@ func (pool *TxPool) submitTransaction(ctx context.Context, wallet *Wallet, tx *t
 
 			if err == nil {
 				success = true
+				// Reset failure count on successful transaction
+				client.ResetFailureCount()
 				submitCount--
 				if submitCount == 0 {
 					break
 				}
-			} else if submitErr == nil {
-				submitErr = err
+			} else {
+				// Increment failure count on error
+				client.IncrementFailureCount()
+				if submitErr == nil {
+					submitErr = err
+				}
 			}
 		}
 
@@ -1286,7 +1292,12 @@ func (pool *TxPool) rebroadcastTransaction(ctx context.Context, tx *types.Transa
 		}
 
 		if err == nil || strings.Contains(err.Error(), "already known") {
+			// Reset failure count on successful rebroadcast
+			client.ResetFailureCount()
 			break
+		} else {
+			// Increment failure count on rebroadcast error
+			client.IncrementFailureCount()
 		}
 	}
 }
